@@ -1,0 +1,2 @@
+CREATE SCHEMA IF NOT EXISTS {{DB}}.MART
+  COMMENT = 'Reporting tables';

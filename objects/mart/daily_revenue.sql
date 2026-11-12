@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS {{DB}}.MART.DAILY_REVENUE (
+  ORDER_DATE     DATE          NOT NULL,
+  CHANNEL        VARCHAR(20)   NOT NULL,
+  ORDERS         NUMBER(38,0)  NOT NULL,
+  REVENUE_USD    NUMBER(14,2),
+  AVG_ORDER_USD  NUMBER(12,2),
+  DISCOUNT_PCT   NUMBER(6,2),
+  BUILT_AT       TIMESTAMP_NTZ NOT NULL
+) COMMENT = 'Daily revenue by sales channel, rebuilt by the pipeline';

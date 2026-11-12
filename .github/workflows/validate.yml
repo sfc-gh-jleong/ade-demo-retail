@@ -1,0 +1,24 @@
+# Checks the SQL in pull requests. This is the required status check on main.
+# It needs no Snowflake access, so pull requests from forks never receive
+# credentials.
+name: Validate
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check object files and deploy script
+        run: python3 scripts/validate.py

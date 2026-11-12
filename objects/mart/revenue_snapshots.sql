@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS {{DB}}.MART.REVENUE_SNAPSHOTS (
+  SNAPSHOT_AT  TIMESTAMP_NTZ NOT NULL,
+  DAYS         NUMBER(38,0),
+  ORDERS       NUMBER(38,0),
+  REVENUE_USD  NUMBER(16,2)
+) COMMENT = 'Point-in-time revenue totals published after each build';

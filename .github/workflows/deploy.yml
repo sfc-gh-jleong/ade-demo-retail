@@ -1,0 +1,140 @@
+# Deploys objects/ to the demo database on every push to main, records the
+# deploy in DEPLOY.CHANGE_HISTORY, then runs the pipeline once.
+#
+# Auth is GitHub OIDC -> Snowflake workload identity (service user
+# GHA_ADE_DEMO_SVC); no password, key or token is stored in GitHub. The job
+# runs in the `demo` environment, which only main can deploy to, so the OIDC
+# subject is repo:sfc-gh-jleong@204736462/ade-demo-retail@1454587771:environment:demo.
+#
+# This repository is public, and so are these logs: no step prints connection
+# details, and the account identifier is a repository secret (masked).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "objects/**"
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-ade-demo-retail
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: demo
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: read
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: GHA_ADE_DEMO_SVC
+      SNOWFLAKE_ROLE: ADE_DEMO_OWNER
+      SNOWFLAKE_WAREHOUSE: COMPUTE_WH
+      DB: ADE_DEMO_RETAIL
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Mask account identifier
+        run: |
+          if [ -z "$SNOWFLAKE_ACCOUNT" ]; then
+            echo "The SNOWFLAKE_ACCOUNT repository secret is not set." >&2
+            exit 1
+          fi
+          # The secret itself is masked; hostnames can also show it in lower
+          # case and with hyphens for underscores.
+          lower="$(printf '%s' "$SNOWFLAKE_ACCOUNT" | tr '[:upper:]' '[:lower:]')"
+          echo "::add-mask::$lower"
+          echo "::add-mask::$(printf '%s' "$lower" | tr '_' '-')"
+
+      - name: Check SQL
+        run: python3 scripts/validate.py
+
+      - name: Describe this deploy
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          pr=""
+          if [ "$EVENT" = "push" ]; then
+            pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                    --jq '[.[] | select(.merged_at != null)][0].number // empty' 2>/dev/null || true)"
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Every value below is passed into SQL; accept only the expected shapes.
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]                   || { echo "Unexpected commit SHA" >&2; exit 1; }
+          [[ "$pr" =~ ^[0-9]{0,9}$ ]]                             || { echo "Unexpected PR number" >&2; exit 1; }
+          [[ "$EVENT" =~ ^(push|workflow_dispatch)$ ]]            || { echo "Unexpected event" >&2; exit 1; }
+          [[ "$ACTOR" =~ ^[A-Za-z0-9-]{1,39}(\[bot\])?$ ]]        || { echo "Unexpected actor" >&2; exit 1; }
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]{1,20}$ ]]                 || { echo "Unexpected run id" >&2; exit 1; }
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]{1,4}$ ]]             || { echo "Unexpected run attempt" >&2; exit 1; }
+          [[ "$run_url" =~ ^https://github\.com/[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected run URL" >&2; exit 1; }
+          {
+            echo "pr=$pr"
+            echo "run_url=$run_url"
+          } >> "$GITHUB_OUTPUT"
+          echo "Deploying ${GITHUB_SHA:0:7}${pr:+ (PR #$pr)}"
+
+      - name: Set up Snowflake CLI
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+
+      - name: Connect
+        run: |
+          snow connection test -x > /dev/null
+          echo "Connected to Snowflake as $SNOWFLAKE_USER"
+
+      - name: Deploy objects
+        run: snow sql -x --enable-templating JINJA -D "DB=$DB" -f deploy/deploy.sql
+
+      - name: Record deploy
+        id: record
+        env:
+          PR: ${{ steps.meta.outputs.pr }}
+          RUN_URL: ${{ steps.meta.outputs.run_url }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+        run: >
+          snow sql -x --enable-templating JINJA
+          -D "DB=$DB" -D "COMMIT=$GITHUB_SHA" -D "PR=$PR" -D "EVENT=$EVENT" -D "ACTOR=$ACTOR"
+          -D "RUN_ID=$GITHUB_RUN_ID" -D "RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" -D "RUN_URL=$RUN_URL"
+          -f deploy/record_deploy.sql
+
+      - name: Run pipeline
+        run: >
+          snow sql -x --enable-templating JINJA
+          -D "DB=$DB" -D "RUN_ID=$GITHUB_RUN_ID" -D "RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT"
+          -f deploy/run_pipeline.sql
+
+      - name: Record pipeline failure
+        if: failure() && steps.record.outcome == 'success'
+        run: >
+          snow sql -x -q "UPDATE ${DB}.DEPLOY.CHANGE_HISTORY
+          SET PIPELINE_STATUS = 'FAILED', PIPELINE_FINISHED_AT = SYSDATE()
+          WHERE RUN_ID = '${GITHUB_RUN_ID}' AND RUN_ATTEMPT = ${GITHUB_RUN_ATTEMPT}"
+
+      - name: Summary
+        if: always()
+        env:
+          PR: ${{ steps.meta.outputs.pr }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          {
+            echo "### Deploy ${OUTCOME}"
+            echo "Commit \`${GITHUB_SHA:0:7}\`${PR:+ from PR #$PR}"
+          } >> "$GITHUB_STEP_SUMMARY"
